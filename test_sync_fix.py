@@ -57,15 +57,115 @@ def test_manual_import_invalid():
 
 
 def test_sync_failure_diagnostics():
-    # 官方接口当前被拦截：同步应返回 False，且 last_sync 有诊断信息（仅 1 次尝试，保持测试快）
-    mgr, path = make_mgr()
-    ok = mgr.sync_official_data(fetch_count=2, retries=1)
-    info = mgr.last_sync
-    assert ok is False, "当前环境官方接口应失败"
-    assert info["attempts"] == 1 and info["ok"] is False
-    assert info["error"], "失败时必须记录诊断信息"
-    print(f"PASS sync_failure_diagnostics (error={info['error'][:60]})")
-    os.unlink(path)
+    # 官方接口与备用源都失败时：同步返回 False，且 last_sync 有完整诊断信息
+    import ssq_analyzer
+    orig_get = ssq_analyzer.requests.get
+
+    class FakeResp:
+        status_code = 403
+        text = "网宿云安全平台检测到您当前的访问行为存在异常，请稍后重试..."
+
+    ssq_analyzer.requests.get = lambda *a, **k: FakeResp()
+    try:
+        mgr, path = make_mgr()
+        ok = mgr.sync_official_data(fetch_count=2, retries=1)
+        info = mgr.last_sync
+        assert ok is False
+        assert info["attempts"] == 1 and info["ok"] is False
+        assert info["error"], "失败时必须记录诊断信息"
+        assert "500" in info["error"], f"应注明备用源也失败: {info['error']}"
+        print(f"PASS sync_failure_diagnostics (error={info['error'][:70]})")
+        os.unlink(path)
+    finally:
+        ssq_analyzer.requests.get = orig_get
+
+
+MOBILE_FIXTURE = """
+<div class="kj-info-panel__title">
+  <div class="flex">
+    <span class="c111 fs-12 mr5">26116</span>
+    <span class="fs-12 cB1B1B1">2026-10-11  </span>
+  </div>
+</div>
+<div class="ball-box padding-b-13">
+  <div class="hz-detail flex flex-wrap">
+    <span class="red-ball ball">10</span>
+    <span class="red-ball ball">19</span>
+    <span class="red-ball ball">24</span>
+    <span class="red-ball ball">27</span>
+    <span class="red-ball ball">28</span>
+    <span class="red-ball ball">33</span>
+    <span class="blue-ball ball">12</span>
+  </div>
+</div>
+"""
+
+# 转义版 fixture（500 手机站有时返回 \\n \\' 这类转义 HTML）
+MOBILE_FIXTURE_ESCAPED = MOBILE_FIXTURE.replace("\n", "\\n").replace("'", "\\'")
+
+# 变体：期字在 span 内、日期后带星期
+MOBILE_FIXTURE_V2 = """
+<div class="kj-info-panel__title">
+  <div class="flex">
+    <span class="c111 fs-12 mr5">26116期</span>
+    <span class="fs-12 cB1B1B1">2026-10-11 星期日 </span>
+  </div>
+</div>
+<div class="ball-box padding-b-13">
+  <div class="hz-detail flex flex-wrap">
+    <span class="red-ball ball">10</span>
+    <span class="red-ball ball">19</span>
+    <span class="red-ball ball">24</span>
+    <span class="red-ball ball">27</span>
+    <span class="red-ball ball">28</span>
+    <span class="red-ball ball">33</span>
+    <span class="blue-ball ball">12</span>
+  </div>
+</div>
+"""
+
+
+def test_500_mobile_fallback():
+    # 用本地 fixture 模拟 500 手机站，不依赖网络（覆盖原始与转义两种响应）
+    import ssq_analyzer
+    orig_get = ssq_analyzer.requests.get
+    for fixture in (MOBILE_FIXTURE, MOBILE_FIXTURE_ESCAPED, MOBILE_FIXTURE_V2):
+        class FakeResp:
+            status_code = 200
+            text = fixture
+
+        ssq_analyzer.requests.get = lambda *a, **k: FakeResp()
+        try:
+            mgr, path = make_mgr()
+            assert mgr._sync_from_500_mobile() is True
+            conn = sqlite3.connect(path)
+            row = conn.execute(
+                "SELECT issue, date, r1, r2, r3, r4, r5, r6, blue FROM lottery_records"
+                " WHERE issue='2026116'").fetchone()
+            conn.close()
+            assert row == ("2026116", "2026-10-11", 10, 19, 24, 27, 28, 33, 12), row
+            os.unlink(path)
+        finally:
+            ssq_analyzer.requests.get = orig_get
+    print("PASS 500_mobile_fallback")
+
+
+def test_500_mobile_bad_html():
+    import ssq_analyzer
+    orig_get = ssq_analyzer.requests.get
+
+    class FakeResp:
+        status_code = 200
+        text = "<html>no data here</html>"
+
+    ssq_analyzer.requests.get = lambda *a, **k: FakeResp()
+    try:
+        mgr, path = make_mgr()
+        assert mgr._sync_from_500_mobile() is False
+        os.unlink(path)
+    finally:
+        ssq_analyzer.requests.get = orig_get
+    print("PASS 500_mobile_bad_html")
 
 
 if __name__ == "__main__":
@@ -73,4 +173,6 @@ if __name__ == "__main__":
     test_manual_import_idempotent()
     test_manual_import_invalid()
     test_sync_failure_diagnostics()
-    print("ALL 4 SYNC-FIX TESTS PASSED")
+    test_500_mobile_fallback()
+    test_500_mobile_bad_html()
+    print("ALL 6 SYNC-FIX TESTS PASSED")

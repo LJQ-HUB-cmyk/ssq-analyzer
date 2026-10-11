@@ -37,6 +37,56 @@ class SSQDataManager:
             """)
             conn.commit()
 
+    def _sync_from_500_mobile(self) -> bool:
+        """备用源：500 彩票手机站（m.500.com/kaijiang/ssq/）。
+
+        背景：cwl.gov.cn 官方接口对机房 IP 做网宿云拦截；500 桌面站有 JS 挑战；
+        但 500 手机站可直接返回含最新开奖号码的 HTML（红蓝球 span 标签）。
+        只取最新一期；期号在手机站显示为 5 位缩写（如 26116=2026116），按 "20"+缩写还原。
+        """
+        import re
+        url = "https://m.500.com/kaijiang/ssq/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        }
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                print(f"[Warn] 500手机站返回 HTTP {resp.status_code}")
+                return False
+            html = resp.text
+            # 500 手机站有时返回转义后的 HTML（\\n \\t \\' \\" \\/），先反转义再解析
+            html = (html.replace("\\/", "/").replace("\\n", "\n").replace("\\t", "\t")
+                        .replace("\\'", "'").replace('\\"', '"'))
+            m = re.search(r">(\d{5})期?</span>\s*<span[^>]*>(\d{4}-\d{2}-\d{2})", html)
+            issue = date = None
+            if m:
+                issue, date = "20" + m.group(1), m.group(2)
+            else:
+                # 兜底：在 ball-box 附近分别找期号与日期
+                box_start = html.find("ball-box")
+                head = html[max(0, box_start - 1500):box_start] if box_start >= 0 else html
+                mi = re.search(r">(\d{5})期?<", head)
+                md = re.search(r"(\d{4}-\d{2}-\d{2})", head)
+                if mi and md:
+                    issue, date = "20" + mi.group(1), md.group(1)
+            if not issue or not date:
+                print("[Warn] 500手机站未找到期号/日期")
+                return False
+            box_start = html.find("ball-box")
+            box = html[box_start:box_start + 3000] if box_start >= 0 else html
+            reds = [int(x) for x in re.findall(r"red-ball[^>]*>(\d+)<", box)[:6]]
+            blues = [int(x) for x in re.findall(r"blue-ball[^>]*>(\d+)<", box)[:1]]
+            if len(reds) != 6 or len(set(reds)) != 6 or not all(1 <= x <= 33 for x in reds) \
+                    or len(blues) != 1 or not 1 <= blues[0] <= 16:
+                print(f"[Warn] 500手机站号码解析无效：红{reds} 蓝{blues}")
+                return False
+            return self.import_manual_draw(issue, date, reds, blues[0])
+        except Exception as e:
+            print(f"[Warn] 500手机站同步异常: {e}")
+            return False
+
     def sync_official_data(self, fetch_count: int = 100, retries: int = 3) -> bool:
         """同步官方开奖数据（带重试退避）。返回 True=成功拉到数据，False=失败。
 
@@ -101,6 +151,13 @@ class SSQDataManager:
             if attempt < retries:
                 time.sleep(5 * attempt)  # 退避：5s、10s……
         print(f"[Warn] 官方接口 {retries} 次尝试均失败：{self.last_sync['error']}")
+        # 备用源：500 手机站（官方接口被 IP 封锁时的自动降级）
+        print("[i] 尝试备用源：500 彩票手机站……")
+        if self._sync_from_500_mobile():
+            self.last_sync.update(source="500手机站(m.500.com)", ok=True, error="")
+            print("[OK] 已通过备用源同步最新开奖。")
+            return True
+        self.last_sync["error"] += "；备用源500手机站亦失败"
         return False
 
     def import_manual_draw(self, issue, date, reds, blue, sales="0", pool="0") -> bool:
